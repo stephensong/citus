@@ -128,6 +128,8 @@ static void ErrorIfInsertPartitionColumnDoesNotMatchSelect(Query *query,
 														   RangeTblEntry *subqueryRte,
 														   Oid *
 														   selectPartitionColumnTableId);
+static Oid FindOriginalRelationId(Expr *columnExpression, List *cteListContext,
+								  Query *query);
 static void AddUninstantiatedEqualityQual(Query *query, Var *targetPartitionColumnVar);
 
 
@@ -644,9 +646,24 @@ ErrorIfInsertSelectQueryNotSupported(Query *queryTree, RangeTblEntry *insertRte,
 	Oid selectPartitionColumnTableId = InvalidOid;
 	Oid targetRelationId = insertRte->relid;
 	char targetPartitionMethod = PartitionMethod(targetRelationId);
+	ListCell *rangeTableCell = NULL;
 
 	/* we only do this check for INSERT ... SELECT queries */
 	AssertArg(InsertSelectQuery(queryTree));
+
+	/* we do not expect to see a view in modify target */
+	foreach(rangeTableCell, queryTree->rtable)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+		if (rangeTableEntry->rtekind == RTE_RELATION &&
+			rangeTableEntry->relkind == RELKIND_VIEW)
+		{
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("cannot perform distributed planning for the given "
+								   "modification"),
+							errdetail("Cannot modify views")));
+		}
+	}
 
 	subquery = subqueryRte->subquery;
 
@@ -822,6 +839,8 @@ ErrorIfInsertPartitionColumnDoesNotMatchSelect(Query *query, RangeTblEntry *inse
 			AttrNumber originalAttrNo = get_attnum(insertRelationId,
 												   targetEntry->resname);
 			TargetEntry *subqeryTargetEntry = NULL;
+			Oid originalRelationId = InvalidOid;
+			List *cteListContext = NIL;
 
 			if (originalAttrNo != insertPartitionColumn->varattno)
 			{
@@ -837,11 +856,21 @@ ErrorIfInsertPartitionColumnDoesNotMatchSelect(Query *query, RangeTblEntry *inse
 				break;
 			}
 
+			cteListContext = list_make1(query->cteList);
+			originalRelationId = FindOriginalRelationId(subqeryTargetEntry->expr,
+														cteListContext, subquery);
+
+			if (originalRelationId == InvalidOid)
+			{
+				partitionColumnsMatch = false;
+				break;
+			}
+
 			/*
 			 * Reference tables doesn't have a partition column, thus partition columns
 			 * cannot match at all.
 			 */
-			if (PartitionMethod(subqeryTargetEntry->resorigtbl) == DISTRIBUTE_BY_NONE)
+			if (PartitionMethod(originalRelationId) == DISTRIBUTE_BY_NONE)
 			{
 				partitionColumnsMatch = false;
 				break;
@@ -854,8 +883,7 @@ ErrorIfInsertPartitionColumnDoesNotMatchSelect(Query *query, RangeTblEntry *inse
 			}
 
 			partitionColumnsMatch = true;
-			*selectPartitionColumnTableId = subqeryTargetEntry->resorigtbl;
-
+			*selectPartitionColumnTableId = originalRelationId;
 			break;
 		}
 	}
@@ -867,6 +895,107 @@ ErrorIfInsertPartitionColumnDoesNotMatchSelect(Query *query, RangeTblEntry *inse
 							   "the same ordinal position as the INSERT's partition "
 							   "column")));
 	}
+}
+
+
+/*
+ * FindOriginalTableId recursively traverses query tree to find actual relation
+ * id that columnExpression refers to. It returns InvolidOid if Var is a non-relational
+ * or computed value from an inner subquery or cte. This is very similar to
+ * IsPartitionColumnRecursive.
+ */
+static Oid
+FindOriginalRelationId(Expr *columnExpression, List *cteListContext, Query *query)
+{
+	Var *candidateColumn = NULL;
+	List *rangetableList = query->rtable;
+	Index rangeTableEntryIndex = 0;
+	RangeTblEntry *rangeTableEntry = NULL;
+	Expr *strippedColumnExpression = (Expr *) strip_implicit_coercions(
+		(Node *) columnExpression);
+	Oid relationId = InvalidOid;
+
+	if (IsA(strippedColumnExpression, Var))
+	{
+		candidateColumn = (Var *) strippedColumnExpression;
+	}
+	else if (IsA(strippedColumnExpression, FieldSelect))
+	{
+		FieldSelect *compositeField = (FieldSelect *) strippedColumnExpression;
+		Expr *fieldExpression = compositeField->arg;
+
+		if (IsA(fieldExpression, Var))
+		{
+			candidateColumn = (Var *) fieldExpression;
+		}
+	}
+
+	if (candidateColumn == NULL)
+	{
+		return InvalidOid;
+	}
+
+	rangeTableEntryIndex = candidateColumn->varno - 1;
+	rangeTableEntry = list_nth(rangetableList, rangeTableEntryIndex);
+
+	if (rangeTableEntry->rtekind == RTE_RELATION)
+	{
+		relationId = rangeTableEntry->relid;
+	}
+	else if (rangeTableEntry->rtekind == RTE_SUBQUERY)
+	{
+		Query *subquery = rangeTableEntry->subquery;
+		List *targetEntryList = subquery->targetList;
+		AttrNumber targetEntryIndex = candidateColumn->varattno - 1;
+		TargetEntry *subqueryTargetEntry = list_nth(targetEntryList, targetEntryIndex);
+		Expr *subColumnExpression = subqueryTargetEntry->expr;
+
+		/* append current cteList to an existing cteListContext */
+		cteListContext = lappend(cteListContext, query->cteList);
+		relationId = FindOriginalRelationId(subColumnExpression, cteListContext,
+											subquery);
+	}
+	else if (rangeTableEntry->rtekind == RTE_JOIN)
+	{
+		List *joinColumnList = rangeTableEntry->joinaliasvars;
+		AttrNumber joinColumnIndex = candidateColumn->varattno - 1;
+		Expr *joinColumn = list_nth(joinColumnList, joinColumnIndex);
+
+		/* cteListContext stays the same since still in the same query boundary */
+		relationId = FindOriginalRelationId(joinColumn, cteListContext, query);
+	}
+	else if (rangeTableEntry->rtekind == RTE_CTE)
+	{
+		int cteListIndex = cteListContext->length - rangeTableEntry->ctelevelsup;
+		List *cteList = list_nth(cteListContext, cteListIndex);
+		ListCell *cteListCell = NULL;
+		CommonTableExpr *cte = NULL;
+
+		foreach(cteListCell, cteList)
+		{
+			CommonTableExpr *candidateCte = (CommonTableExpr *) lfirst(cteListCell);
+			if (strcmp(candidateCte->ctename, rangeTableEntry->ctename) == 0)
+			{
+				cte = candidateCte;
+				break;
+			}
+		}
+
+		if (cte != NULL)
+		{
+			Query *cteQuery = (Query *) cte->ctequery;
+			List *targetEntryList = cteQuery->targetList;
+			AttrNumber targetEntryIndex = candidateColumn->varattno - 1;
+			TargetEntry *targetEntry = list_nth(targetEntryList, targetEntryIndex);
+
+			/* append current cteList to an existing cteListContext */
+			cteListContext = lappend(cteListContext, cteQuery->cteList);
+			relationId = FindOriginalRelationId(targetEntry->expr, cteListContext,
+												cteQuery);
+		}
+	}
+
+	return relationId;
 }
 
 
@@ -1053,6 +1182,15 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 		if (rangeTableEntry->rtekind == RTE_RELATION)
 		{
 			queryTableCount++;
+
+			/* we do not expect to see a view in modify query */
+			if (rangeTableEntry->relkind == RELKIND_VIEW)
+			{
+				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								errmsg("cannot perform distributed planning for the "
+									   "given modification"),
+								errdetail("Cannot modify views")));
+			}
 		}
 		else if (rangeTableEntry->rtekind == RTE_VALUES)
 		{
@@ -2336,7 +2474,7 @@ UpdateRelationNames(Node *node, RelationRestrictionContext *restrictionContext)
 
 	newRte = (RangeTblEntry *) node;
 
-	if (newRte->rtekind != RTE_RELATION)
+	if (newRte->rtekind != RTE_RELATION || newRte->relkind == RELKIND_VIEW)
 	{
 		return false;
 	}

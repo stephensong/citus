@@ -111,3 +111,39 @@ CREATE TABLE supplier_single_shard
   	s_comment varchar(101) not null
 );
 SELECT master_create_distributed_table('supplier_single_shard', 's_suppkey', 'append');
+-- tables for view tests
+SET citus.shard_count to 4;
+SET citus.shard_replication_factor to 1;
+
+CREATE TABLE lineitem_view_test (
+	l_orderkey bigint not null,
+	l_partkey integer not null,
+	l_suppkey integer not null,
+	l_linenumber integer not null,
+	l_quantity decimal(15, 2) not null,
+	l_extendedprice decimal(15, 2) not null,
+	l_discount decimal(15, 2) not null,
+	l_tax decimal(15, 2) not null,
+	l_returnflag char(1) not null,
+	l_linestatus char(1) not null,
+	l_shipdate date not null,
+	l_commitdate date not null,
+	l_receiptdate date not null,
+	l_shipinstruct char(25) not null,
+	l_shipmode char(10) not null,
+	l_comment varchar(44) not null );
+
+SELECT create_distributed_table('lineitem_view_test', 'l_orderkey');
+
+CREATE TABLE orders_view_test (
+	o_orderkey integer,
+	o_custkey integer,
+	o_orderstatus char(1),
+	o_totalprice decimal(15,2),
+	o_orderdate date,
+	o_orderpriority char(15),
+	o_clerk char(15),
+	o_shippriority integer,
+	o_comment varchar(79) );
+
+SELECT create_distributed_table('orders_view_test', 'o_orderkey');

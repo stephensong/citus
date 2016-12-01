@@ -16,6 +16,7 @@
 
 #include "access/nbtree.h"
 #include "catalog/pg_am.h"
+#include "catalog/pg_class.h"
 #include "commands/defrem.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_logical_optimizer.h"
@@ -57,6 +58,7 @@ static RuleApplyFunction RuleApplyFunctionArray[JOIN_RULE_LAST] = { 0 }; /* join
 static MultiNode * MultiPlanTree(Query *queryTree);
 static void ErrorIfQueryNotSupported(Query *queryTree);
 static bool HasUnsupportedJoinWalker(Node *node, void *context);
+static bool QueryReferencesView(Query *subquery);
 static void ErrorIfSubqueryNotSupported(Query *subqueryTree);
 static bool HasTablesample(Query *queryTree);
 static bool HasOuterJoin(Query *queryTree);
@@ -299,7 +301,7 @@ MultiPlanTree(Query *queryTree)
 		 * elements.
 		 */
 		joinClauseList = JoinClauseList(whereClauseList);
-		tableEntryList = TableEntryList(rangeTableList);
+		tableEntryList = UsedTableEntryList(queryTree);
 
 		/* build the list of multi table nodes */
 		tableNodeList = MultiTableNodeList(tableEntryList, rangeTableList);
@@ -514,6 +516,24 @@ HasUnsupportedJoinWalker(Node *node, void *context)
 }
 
 
+/* QueryReferencesView returns true if the query references a view RTE */
+static bool
+QueryReferencesView(Query *subquery)
+{
+	ListCell *rangeTableCell = NULL;
+	foreach(rangeTableCell, subquery->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(rangeTableCell);
+		if (rte->rtekind == RTE_RELATION && rte->relkind == RELKIND_VIEW)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
 /*
  * ErrorIfSubqueryNotSupported checks that we can perform distributed planning for
  * the given subquery.
@@ -552,6 +572,17 @@ ErrorIfSubqueryNotSupported(Query *subqueryTree)
 	{
 		preconditionsSatisfied = false;
 		errorDetail = "Subqueries with offset are not supported yet";
+	}
+
+	/*
+	 * Subqueries with views turned out to problematic with outer joins and set
+	 * operations. Disabling views for subquery pushdown at the moment. We may
+	 * want to revisit this to introduce view support for subquery pushdown.
+	 */
+	if (QueryReferencesView(subqueryTree))
+	{
+		preconditionsSatisfied = false;
+		errorDetail = "Subqueries with views are not supported yet";
 	}
 
 	/* finally check and error out if not satisfied */
@@ -1014,6 +1045,45 @@ TableEntryList(List *rangeTableList)
 		 * congruent with column's range table reference (varno).
 		 */
 		tableId++;
+	}
+
+	return tableEntryList;
+}
+
+
+/*
+ * UsedTableEntryList returns list of relation range table entries
+ * that are referenced within the query. Unused entries due to query
+ * flattening or re-rewriting are ignored.
+ */
+List *
+UsedTableEntryList(Query *query)
+{
+	List *tableEntryList = NIL;
+	List *rangeTableList = query->rtable;
+	List *joinTreeTableIndexList = NIL;
+	ListCell *joinTreeTableIndexCell = NULL;
+
+	ExtractRangeTableIndexWalker((Node *) query->jointree, &joinTreeTableIndexList);
+	foreach(joinTreeTableIndexCell, joinTreeTableIndexList)
+	{
+		/*
+		 * Join tree's range table index starts from 1 in the query tree. But,
+		 * list indexes start from 0.
+		 */
+		int joinTreeTableIndex = lfirst_int(joinTreeTableIndexCell);
+		int rangeTableListIndex = joinTreeTableIndex - 1;
+		RangeTblEntry *rangeTableEntry =
+			(RangeTblEntry *) list_nth(rangeTableList, rangeTableListIndex);
+
+		if (rangeTableEntry->rtekind == RTE_RELATION)
+		{
+			TableEntry *tableEntry = (TableEntry *) palloc0(sizeof(TableEntry));
+			tableEntry->relationId = rangeTableEntry->relid;
+			tableEntry->rangeTableId = joinTreeTableIndex;
+
+			tableEntryList = lappend(tableEntryList, tableEntry);
+		}
 	}
 
 	return tableEntryList;
@@ -1560,7 +1630,8 @@ ExtractRangeTableRelationWalker(Node *node, List **rangeTableRelationList)
 	foreach(rangeTableCell, rangeTableList)
 	{
 		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-		if (rangeTableEntry->rtekind == RTE_RELATION)
+		if (rangeTableEntry->rtekind == RTE_RELATION &&
+			rangeTableEntry->relkind != RELKIND_VIEW)
 		{
 			(*rangeTableRelationList) = lappend(*rangeTableRelationList, rangeTableEntry);
 		}
