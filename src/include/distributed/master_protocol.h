@@ -19,6 +19,7 @@
 #include "fmgr.h"
 
 #include "nodes/pg_list.h"
+#include "distributed/master_metadata_utility.h"
 
 
 /*
@@ -116,6 +117,9 @@ extern Oid ForeignConstraintGetReferencedTableId(char *queryString);
 extern void CheckHashPartitionedTable(Oid distributedTableId);
 extern void CheckTableSchemaNameForDrop(Oid relationId, char **schemaName,
 										char **tableName);
+extern ShardInterval * DistributionValueShardInterval(Oid relationId, Oid
+													  distributionDataType,
+													  Datum distributionValue);
 
 /* Function declarations for generating metadata for shard and placement creation */
 extern Datum master_get_table_metadata(PG_FUNCTION_ARGS);
@@ -137,6 +141,7 @@ extern Datum master_drop_all_shards(PG_FUNCTION_ARGS);
 
 /* function declarations for shard creation functionality */
 extern Datum master_create_worker_shards(PG_FUNCTION_ARGS);
+extern Datum isolate_tenant_to_new_shard(PG_FUNCTION_ARGS);
 
 /* function declarations for shard repair functionality */
 extern Datum master_copy_shard_placement(PG_FUNCTION_ARGS);

@@ -26,11 +26,14 @@
 
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "distributed/commit_protocol.h"
 #include "distributed/connection_cache.h"
 #include "distributed/listutils.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/master_protocol.h"
+#include "distributed/metadata_cache.h"
 #include "distributed/multi_join_order.h"
+#include "distributed/multi_shard_transaction.h"
 #include "distributed/pg_dist_partition.h"
 #include "distributed/pg_dist_shard.h"
 #include "distributed/resource_lock.h"
@@ -51,11 +54,15 @@
 
 
 /* local function forward declarations */
+static uint64 SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue);
+static char * CreateTableInRangeCommand(ShardInterval *oldShardInterval,
+										ShardInterval *newShardInterval);
 static text * IntegerToText(int32 value);
 
 
 /* declarations for dynamic loading */
 PG_FUNCTION_INFO_V1(master_create_worker_shards);
+PG_FUNCTION_INFO_V1(isolate_tenant_to_new_shard);
 
 
 /*
@@ -73,6 +80,188 @@ master_create_worker_shards(PG_FUNCTION_ARGS)
 	CreateShardsWithRoundRobinPolicy(distributedTableId, shardCount, replicationFactor);
 
 	PG_RETURN_VOID();
+}
+
+
+Datum
+isolate_tenant_to_new_shard(PG_FUNCTION_ARGS)
+{
+	Oid relationId = PG_GETARG_OID(0);
+	Datum tenantIdDatum = PG_GETARG_DATUM(1);
+
+	Oid tenantIdDataType = get_fn_expr_argtype(fcinfo->flinfo, 1);
+	ShardInterval *shardInterval = NULL;
+	FmgrInfo *hashFunction = NULL;
+	int hashedValue = 0;
+	DistTableCacheEntry *cacheEntry = NULL;
+	uint64 isolatedShardId = 0;
+
+	shardInterval = DistributionValueShardInterval(relationId, tenantIdDataType,
+												   tenantIdDatum);
+
+	cacheEntry = DistributedTableCacheEntry(relationId);
+	hashFunction = cacheEntry->hashFunction;
+	hashedValue = DatumGetInt32(FunctionCall1(hashFunction, tenantIdDatum));
+
+	isolatedShardId = SplitShardForTenant(shardInterval, hashedValue);
+
+	PG_RETURN_INT64(isolatedShardId);
+}
+
+
+static uint64
+SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue)
+{
+	/* XXX: is it safe to use directly hashed value */
+	int isolatedShardIndex = 0;
+	ShardInterval *isolatedShardInterval = NULL;
+	List *newShardIntervalList = NIL;
+	List *createNewShardCommandList = NIL;
+	ListCell *shardIntervalCell = NULL;
+
+	/* get min and max values of the target shard */
+	List *oldShardIntervalList = list_make1(oldShardInterval);
+	int32 shardMinValue = DatumGetInt32(oldShardInterval->minValue);
+	int32 shardMaxValue = DatumGetInt32(oldShardInterval->maxValue);
+
+	ShardInterval *isolatedTenantShardInterval = NULL;
+	char *userName = CurrentUserName();
+
+	/* add lower range if exists */
+	if (shardMinValue < hashedValue)
+	{
+		ShardInterval *lowerShardRange = CitusMakeNode(ShardInterval);
+		lowerShardRange->minValue = Int32GetDatum(shardMinValue);
+		lowerShardRange->maxValue = Int32GetDatum(hashedValue - 1);
+
+		newShardIntervalList = lappend(newShardIntervalList, lowerShardRange);
+	}
+
+	isolatedTenantShardInterval = CitusMakeNode(ShardInterval);
+	isolatedTenantShardInterval->minValue = Int32GetDatum(hashedValue);
+	isolatedTenantShardInterval->maxValue = Int32GetDatum(hashedValue);
+
+	isolatedShardIndex = list_length(newShardIntervalList);
+	newShardIntervalList = lappend(newShardIntervalList, isolatedTenantShardInterval);
+
+	/* add upper range if exists */
+	if (shardMaxValue > hashedValue)
+	{
+		ShardInterval *upperShardRange = CitusMakeNode(ShardInterval);
+		upperShardRange->minValue = Int32GetDatum(hashedValue + 1);
+		upperShardRange->maxValue = Int32GetDatum(shardMaxValue);
+
+		newShardIntervalList = lappend(newShardIntervalList, upperShardRange);
+	}
+
+	if (list_length(newShardIntervalList) == 1)
+	{
+		return oldShardInterval->shardId;
+	}
+
+	foreach(shardIntervalCell, newShardIntervalList)
+	{
+		ShardInterval *newShardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		char *createTableInRangeCommand = NULL;
+
+		newShardInterval->relationId = oldShardInterval->relationId;
+		newShardInterval->shardId = GetNextShardId();
+
+		createTableInRangeCommand = CreateTableInRangeCommand(oldShardInterval,
+															  newShardInterval);
+		createNewShardCommandList = lappend(createNewShardCommandList,
+											createTableInRangeCommand);
+	}
+
+	OpenTransactionsToAllShardPlacements(oldShardIntervalList, userName);
+
+	foreach(shardIntervalCell, oldShardIntervalList)
+	{
+		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+		bool shardConnectionsFound = false;
+
+		ShardConnections *shardConnections = GetShardConnections(shardInterval->shardId,
+																 &shardConnectionsFound);
+
+		List *targetConnectionList = shardConnections->connectionList;
+
+		ListCell *commandCell = NULL;
+
+		foreach(commandCell, createNewShardCommandList)
+		{
+			char *command = (char *) lfirst(commandCell);
+			ListCell *connectionCell = NULL;
+
+			foreach(connectionCell, targetConnectionList)
+			{
+				TransactionConnection *transactionConnection =
+					(TransactionConnection *) lfirst(connectionCell);
+
+				PGconn *connection = transactionConnection->connection;
+
+				int querySent = PQsendQuery(connection, command);
+				if (querySent == 0)
+				{
+					ReraiseRemoteError(connection, NULL);
+				}
+			}
+
+			foreach(connectionCell, targetConnectionList)
+			{
+				TransactionConnection *transactionConnection =
+					(TransactionConnection *) lfirst(connectionCell);
+
+				PGconn *connection = transactionConnection->connection;
+				PGresult *result = PQgetResult(connection);
+				ExecStatusType resultStatus = PQresultStatus(result);
+
+				/* there is a function for this */
+				if (!(resultStatus == PGRES_SINGLE_TUPLE || resultStatus ==
+					  PGRES_TUPLES_OK ||
+					  resultStatus == PGRES_COMMAND_OK))
+				{
+					ReraiseRemoteError(connection, result);
+				}
+
+				PQclear(result);
+
+				/* clear NULL result */
+				PQgetResult(connection);
+			}
+		}
+	}
+
+	isolatedShardInterval = list_nth(newShardIntervalList, isolatedShardIndex);
+
+	return isolatedShardInterval->shardId;
+}
+
+
+static char *
+CreateTableInRangeCommand(ShardInterval *oldShardInterval,
+						  ShardInterval *newShardInterval)
+{
+	StringInfo createTableInRangeCommand = makeStringInfo();
+
+	char *oldShardName = ConstructQualifiedShardName(oldShardInterval);
+	char *newShardName = ConstructQualifiedShardName(newShardInterval);
+
+	Oid relationId = oldShardInterval->relationId;
+	Var *partitionKey = PartitionKey(relationId);
+	char *partitionColumnName = get_attname(relationId, partitionKey->varattno);
+
+	int32 shardMinValue = DatumGetInt32(newShardInterval->minValue);
+	int32 shardMaxValue = DatumGetInt32(newShardInterval->maxValue);
+
+	/* XXX: replace hashint8 with an udf of us to make it correctly work */
+	appendStringInfo(createTableInRangeCommand,
+					 "CREATE TABLE %s AS SELECT * FROM %s WHERE "
+					 "hashint8(%s) >= %d AND hashint8(%s) <= %d",
+					 newShardName, oldShardName,
+					 partitionColumnName, shardMinValue,
+					 partitionColumnName, shardMaxValue);
+
+	return createTableInRangeCommand->data;
 }
 
 

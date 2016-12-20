@@ -68,6 +68,7 @@ extern List * FinalizedShardPlacementList(uint64 shardId);
 extern List * ShardPlacementList(uint64 shardId);
 extern ShardPlacement * TupleToShardPlacement(TupleDesc tupleDesc,
 											  HeapTuple heapTuple);
+extern char * ConstructQualifiedShardName(ShardInterval *shardInterval);
 
 /* Function declarations to modify shard and shard placement data */
 extern void InsertShardRow(Oid relationId, uint64 shardId, char storageType,
