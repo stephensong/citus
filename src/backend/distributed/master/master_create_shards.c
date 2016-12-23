@@ -54,9 +54,11 @@
 
 
 /* local function forward declarations */
-static uint64 SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue);
+static uint64 SplitShardForTenant(ShardInterval *oldShardInterval,
+								  char *hashFunctionName, int hashedValue);
 static char * CreateTableInRangeCommand(ShardInterval *oldShardInterval,
-										ShardInterval *newShardInterval);
+										ShardInterval *newShardInterval,
+										char *hashFunctionName);
 static text * IntegerToText(int32 value);
 
 
@@ -93,24 +95,30 @@ isolate_tenant_to_new_shard(PG_FUNCTION_ARGS)
 	ShardInterval *shardInterval = NULL;
 	FmgrInfo *hashFunction = NULL;
 	int hashedValue = 0;
+	char *hashFunctionName = NULL;
+
 	DistTableCacheEntry *cacheEntry = NULL;
 	uint64 isolatedShardId = 0;
 
 	shardInterval = DistributionValueShardInterval(relationId, tenantIdDataType,
 												   tenantIdDatum);
 
+
 	cacheEntry = DistributedTableCacheEntry(relationId);
 	hashFunction = cacheEntry->hashFunction;
+	hashFunctionName = get_func_name(hashFunction->fn_oid);
 	hashedValue = DatumGetInt32(FunctionCall1(hashFunction, tenantIdDatum));
 
-	isolatedShardId = SplitShardForTenant(shardInterval, hashedValue);
+
+	isolatedShardId = SplitShardForTenant(shardInterval, hashFunctionName, hashedValue);
 
 	PG_RETURN_INT64(isolatedShardId);
 }
 
 
 static uint64
-SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue)
+SplitShardForTenant(ShardInterval *oldShardInterval, char *hashFunctionName,
+					int hashedValue)
 {
 	/* XXX: is it safe to use directly hashed value */
 	int isolatedShardIndex = 0;
@@ -168,7 +176,8 @@ SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue)
 		newShardInterval->shardId = GetNextShardId();
 
 		createTableInRangeCommand = CreateTableInRangeCommand(oldShardInterval,
-															  newShardInterval);
+															  newShardInterval,
+															  hashFunctionName);
 		createNewShardCommandList = lappend(createNewShardCommandList,
 											createTableInRangeCommand);
 	}
@@ -239,7 +248,8 @@ SplitShardForTenant(ShardInterval *oldShardInterval, int hashedValue)
 
 static char *
 CreateTableInRangeCommand(ShardInterval *oldShardInterval,
-						  ShardInterval *newShardInterval)
+						  ShardInterval *newShardInterval,
+						  char *hashFunctionName)
 {
 	StringInfo createTableInRangeCommand = makeStringInfo();
 
@@ -256,10 +266,10 @@ CreateTableInRangeCommand(ShardInterval *oldShardInterval,
 	/* XXX: replace hashint8 with an udf of us to make it correctly work */
 	appendStringInfo(createTableInRangeCommand,
 					 "CREATE TABLE %s AS SELECT * FROM %s WHERE "
-					 "hashint8(%s) >= %d AND hashint8(%s) <= %d",
+					 "%s(%s) >= %d AND %s(%s) <= %d",
 					 newShardName, oldShardName,
-					 partitionColumnName, shardMinValue,
-					 partitionColumnName, shardMaxValue);
+					 hashFunctionName, partitionColumnName, shardMinValue,
+					 hashFunctionName, partitionColumnName, shardMaxValue);
 
 	return createTableInRangeCommand->data;
 }
