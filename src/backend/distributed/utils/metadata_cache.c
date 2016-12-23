@@ -232,6 +232,21 @@ LoadShardInterval(uint64 shardId)
 
 
 /*
+ + * ReplicationModel returns the replication model for the given relation. The function
+ + * errors out for tables that are not distributed.
+ + */
+char
+ReplicationModel(Oid relationId)
+{
+	DistTableCacheEntry *partitionEntry = DistributedTableCacheEntry(relationId);
+
+	char replicationModel = partitionEntry->replicationModel;
+
+	return replicationModel;
+}
+
+
+/*
  * DistributedTableCacheEntry looks up a pg_dist_partition entry for a
  * relation.
  *

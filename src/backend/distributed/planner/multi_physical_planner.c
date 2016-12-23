@@ -4026,6 +4026,13 @@ CreateBasicTask(uint64 jobId, uint32 taskId, TaskType taskType, char *queryStrin
 	task->taskType = taskType;
 	task->queryString = queryString;
 
+	/*
+	 * We currently do not take replication model into account for tasks other
+	 * than modifications. Thus, set it to invalid and allow the caller to decide
+	 * whether to use or not.
+	 */
+	task->replicationModel = REPLICATION_MODEL_INVALID;
+
 	return task;
 }
 

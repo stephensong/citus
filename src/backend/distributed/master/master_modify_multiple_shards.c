@@ -202,6 +202,12 @@ ModifyMultipleShardsTaskList(Query *query, List *shardIntervalList, Oid relation
 		task->anchorShardId = shardId;
 		task->taskPlacementList = FinalizedShardPlacementList(shardId);
 
+		/*
+		 * We currently do not take replication model into account for tasks other
+		 * than modifications. Thus, set it to invalid.
+		 */
+		task->replicationModel = REPLICATION_MODEL_INVALID;
+
 		taskList = lappend(taskList, task);
 	}
 

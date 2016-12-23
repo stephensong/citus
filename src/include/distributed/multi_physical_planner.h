@@ -169,6 +169,7 @@ typedef struct Task
 	uint64 shardId;                /* only applies to shard fetch tasks */
 	TaskExecution *taskExecution;  /* used by task tracker executor */
 	bool upsertQuery;              /* only applies to modify tasks */
+	char replicationModel;         /* only applies to modify tasks */
 
 	bool insertSelectQuery;
 	List *relationShardList;       /* only applies INSERT/SELECT tasks */

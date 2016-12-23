@@ -30,6 +30,7 @@
 #include "distributed/multi_client_executor.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/multi_server_executor.h"
+#include "distributed/pg_dist_partition.h"
 #include "distributed/worker_protocol.h"
 #include "storage/fd.h"
 #include "utils/builtins.h"
@@ -2765,6 +2766,12 @@ JobCleanupTask(uint64 jobId)
 	jobCleanupTask->jobId = jobId;
 	jobCleanupTask->taskId = JOB_CLEANUP_TASK_ID;
 	jobCleanupTask->queryString = jobCleanupQuery->data;
+
+	/*
+	 * We currently do not take replication model into account for tasks other
+	 * than modifications. Thus, set it to invalid.
+	 */
+	jobCleanupTask->replicationModel = REPLICATION_MODEL_INVALID;
 
 	return jobCleanupTask;
 }
